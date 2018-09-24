@@ -8,6 +8,8 @@ is a single file HTTP proxy with support for CONNECT requests and without a
 install requirement. When working on remote computers, I can just copy an
 executable file and get the proxy functionality working.
 
+It supports normal and transparent proxy, including websockets.
+
 ## Usage
 
 Proxii will listen by default on `localhost:8080` you can change it by giving a

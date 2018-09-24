@@ -6,13 +6,15 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"os"
+	"strings"
 	"sync/atomic"
 )
 
 const (
 	defaultListenPort = "localhost:8080"
-	proxiiVersion     = "0.3.0"
+	proxiiVersion     = "0.4.0"
 )
 
 func main() {
@@ -69,6 +71,8 @@ func (p *proxii) ServeHTTP(response http.ResponseWriter, request *http.Request) 
 
 	if request.Method == "CONNECT" {
 		handleConnect(requestID, response, request)
+	} else if strings.ToLower(request.Header.Get("Connection")) == "upgrade" && strings.ToLower(request.Header.Get("upgrade")) == "websocket" {
+		handleWebsocket(requestID, response, request)
 	} else {
 		handleRequest(requestID, response, request)
 	}
@@ -116,6 +120,15 @@ func handleConnect(requestID uint64, response http.ResponseWriter, request *http
 func handleRequest(requestID uint64, response http.ResponseWriter, request *http.Request) {
 	rh := response.Header()
 
+	// the next two are to support transparent proxy function
+	if request.URL.Scheme == "" {
+		request.URL.Scheme = "http"
+	}
+
+	if request.URL.Host == "" {
+		request.URL.Host = request.Host
+	}
+
 	creq, err := http.NewRequest(request.Method, request.URL.String(), request.Body)
 	if err != nil {
 		log.Print(requestID, "| NewRequest error: ", err)
@@ -150,4 +163,58 @@ func handleRequest(requestID uint64, response http.ResponseWriter, request *http
 	response.WriteHeader(cresp.StatusCode)
 
 	io.Copy(response, cresp.Body)
+}
+
+func handleWebsocket(requestID uint64, response http.ResponseWriter, request *http.Request) {
+	rh := response.Header()
+
+	conn, err := net.Dial("tcp", request.Host)
+	if err != nil {
+		if neterror, ok := err.(*net.OpError); ok {
+			switch realerror := neterror.Err.(type) {
+			case *net.DNSError:
+				log.Print(requestID, "| WSConnect error(dns): ", realerror.Error())
+
+			default:
+				log.Print(requestID, "| WSConnect error:(net)", realerror.Error())
+			}
+		} else {
+			log.Print(requestID, "| WSConnect error(gen): ", err)
+		}
+		rh.Add("Content-Type", "text/plain")
+		response.WriteHeader(http.StatusBadGateway)
+		fmt.Fprintf(response, "WSConnect error: %v", err)
+		return
+	}
+
+	defer conn.Close()
+
+	request.URL.Scheme = "ws"
+	request.URL.Host = request.Host
+
+	// well, theoretically httputil.DumpRequest shouldn't be used... but it works
+	reconstructedResponse, err := httputil.DumpRequest(request, false)
+	if err != nil {
+		log.Print("cannot reconstruct:", err)
+		rh.Add("Content-Type", "text/plain")
+		response.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(response, "WSConnect dump error: %v", err)
+		return
+	}
+
+	hijacker, _ := response.(http.Hijacker)
+	clientConn, clientRw, err := hijacker.Hijack()
+
+	defer clientConn.Close()
+
+	log.Print(requestID, "| WSConnect success")
+
+	conn.Write(reconstructedResponse)
+
+	log.Print(requestID, "| WSConnect Wrote header")
+
+	// handshake and such handled directly between interested parties
+
+	go io.Copy(conn, clientRw)
+	io.Copy(clientRw, conn)
 }
