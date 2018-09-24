@@ -12,7 +12,7 @@ import (
 
 const (
 	defaultListenPort = "localhost:8080"
-	proxiiVersion     = "0.2.2"
+	proxiiVersion     = "0.3.0"
 )
 
 func main() {
@@ -23,13 +23,43 @@ func main() {
 		listenAddr = os.Args[1]
 	}
 
-	log.Print("Listen on ", listenAddr)
+	ps, err := newProxii(listenAddr)
+	if err != nil {
+		log.Fatalf("Cannot create Proxii: %v", err)
+	}
 
-	http.ListenAndServe(listenAddr, &proxii{})
+	log.Printf("Listenin on port: %d", ps.listener.Addr())
+
+	ps.serve()
 }
 
 type proxii struct {
 	requestCounter uint64
+	listener       net.Listener
+	server         *http.Server
+}
+
+func newProxii(addr string) (*proxii, error) {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+
+	result := &proxii{
+		listener: listener,
+	}
+
+	result.server = &http.Server{Handler: result}
+
+	return result, nil
+}
+
+func (p *proxii) serve() error {
+	return http.Serve(p.listener, p)
+}
+
+func (p *proxii) close() error {
+	return p.server.Close()
 }
 
 func (p *proxii) ServeHTTP(response http.ResponseWriter, request *http.Request) {
