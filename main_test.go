@@ -66,38 +66,28 @@ func doRequest(t *testing.T, client *http.Client, r *requestConfig) error {
 	return nil
 }
 
-func TestTestingWebServer(t *testing.T) {
-	testServer, err := newTestingWebServer()
-	if err != nil {
-		t.Fatal("TestingWebServer cannot start", err)
-		return
-	}
-
-	defer testServer.close()
-
-	client := &http.Client{}
+func runTests(t *testing.T, urlBase string, httpClient *http.Client, wsDialer *websocket.Dialer) {
 
 	tests := []struct {
 		name string
 		rc   requestConfig
 	}{
-		{"testGET", requestConfig{"GET", testServer.urlBase + "/get", "", nil, http.StatusOK, []byte("GET /get")}},
-		{"testPUT", requestConfig{"PUT", testServer.urlBase + "/put", "text/plain", strings.NewReader("putbody"), http.StatusOK, []byte("PUT /put: putbody")}},
-		{"testUninplemented", requestConfig{"ZZZ", testServer.urlBase + "/zzz", "", nil, http.StatusNotImplemented, nil}},
-		{"testPOST", requestConfig{"POST", testServer.urlBase + "/form", "application/x-www-form-urlencoded", strings.NewReader(url.Values{"k": {"v"}}.Encode()), http.StatusOK, []byte(`POST /form: {"k":["v"]}`)}},
+		{"testGET", requestConfig{"GET", urlBase + "/get", "", nil, http.StatusOK, []byte("GET /get")}},
+		{"testPUT", requestConfig{"PUT", urlBase + "/put", "text/plain", strings.NewReader("putbody"), http.StatusOK, []byte("PUT /put: putbody")}},
+		{"testUninplemented", requestConfig{"ZZZ", urlBase + "/zzz", "", nil, http.StatusNotImplemented, nil}},
+		{"testPOST", requestConfig{"POST", urlBase + "/form", "application/x-www-form-urlencoded", strings.NewReader(url.Values{"k": {"v"}}.Encode()), http.StatusOK, []byte(`POST /form: {"k":["v"]}`)}},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			doRequest(t, client, &test.rc)
+			doRequest(t, httpClient, &test.rc)
 		})
 	}
 
 	// now test websocket
-	wsDialer := websocket.DefaultDialer
 
 	t.Run("websocket", func(t *testing.T) {
-		wscon, _, err := wsDialer.Dial(strings.Replace(testServer.urlBase, "http", "ws", 1)+"/ws", nil)
+		wscon, _, err := wsDialer.Dial(strings.Replace(urlBase, "http", "ws", 1)+"/ws", nil)
 		if err != nil {
 			t.Errorf("WebSocket connection error: %v", err)
 			return
@@ -125,6 +115,18 @@ func TestTestingWebServer(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestTestingWebServer(t *testing.T) {
+	testServer, err := newTestingWebServer()
+	if err != nil {
+		t.Fatal("TestingWebServer cannot start", err)
+		return
+	}
+
+	defer testServer.close()
+
+	runTests(t, testServer.urlBase, http.DefaultClient, websocket.DefaultDialer)
 }
 
 func TestProxii(t *testing.T) {
@@ -150,63 +152,19 @@ func TestProxii(t *testing.T) {
 		return
 	}
 
+	defer proxii.close()
 	go proxii.serve()
 
-	client := &http.Client{
+	httpClient := &http.Client{
 		Transport: &http.Transport{Proxy: func(request *http.Request) (*url.URL, error) { return proxiiUrl, nil }},
 	}
-
-	tests := []struct {
-		name string
-		rc   requestConfig
-	}{
-		{"testGET", requestConfig{"GET", testServer.urlBase + "/get", "", nil, http.StatusOK, []byte("GET /get")}},
-		{"testPUT", requestConfig{"PUT", testServer.urlBase + "/put", "text/plain", strings.NewReader("putbody"), http.StatusOK, []byte("PUT /put: putbody")}},
-		{"testUninplemented", requestConfig{"ZZZ", testServer.urlBase + "/zzz", "", nil, http.StatusNotImplemented, nil}},
-		{"testPOST", requestConfig{"POST", testServer.urlBase + "/form", "application/x-www-form-urlencoded", strings.NewReader(url.Values{"k": {"v"}}.Encode()), http.StatusOK, []byte(`POST /form: {"k":["v"]}`)}},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			doRequest(t, client, &test.rc)
-		})
-	}
-
-	// now test websocket
 
 	wsDialer := &websocket.Dialer{
 		Proxy: func(request *http.Request) (*url.URL, error) { return proxiiUrl, nil },
 	}
 
-	t.Run("websocket", func(t *testing.T) {
-		wscon, _, err := wsDialer.Dial(strings.Replace(testServer.urlBase, "http", "ws", 1)+"/ws", nil)
-		if err != nil {
-			t.Errorf("WebSocket connection error: %v", err)
-			return
-		}
+	runTests(t, testServer.urlBase, httpClient, wsDialer)
 
-		defer wscon.Close()
-
-		testMessage := []byte("Testing Message")
-
-		err = wscon.WriteMessage(websocket.TextMessage, testMessage)
-		if err != nil {
-			t.Errorf("Websocket Write error: %v", err)
-		} else {
-			mtype, rmsg, err := wscon.ReadMessage()
-
-			switch {
-			case err != nil:
-				t.Errorf("Websocket Receive error: %v", err)
-
-			case mtype != websocket.TextMessage:
-				t.Errorf("Websocket Received incorrect type: %v", mtype)
-
-			case !bytes.Equal(rmsg, testMessage):
-				t.Errorf(`Websocket Received Message is differnt with sent: "%s" != "%s"`, string(rmsg), string(testMessage))
-			}
-		}
-	})
 }
 
 func TestTransparentProxii(t *testing.T) {
@@ -225,32 +183,15 @@ func TestTransparentProxii(t *testing.T) {
 	}
 
 	defer proxii.close()
-
 	go proxii.serve()
 
 	dialer := &net.Dialer{}
 
-	client := &http.Client{
+	httpClient := &http.Client{
 		Transport: &http.Transport{DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			con, err := dialer.DialContext(ctx, "tcp", proxii.listener.Addr().String())
 			return con, err
 		}},
-	}
-
-	tests := []struct {
-		name string
-		rc   requestConfig
-	}{
-		{"testGET", requestConfig{"GET", testServer.urlBase + "/get", "", nil, http.StatusOK, []byte("GET /get")}},
-		{"testPUT", requestConfig{"PUT", testServer.urlBase + "/put", "text/plain", strings.NewReader("putbody"), http.StatusOK, []byte("PUT /put: putbody")}},
-		{"testUninplemented", requestConfig{"ZZZ", testServer.urlBase + "/zzz", "", nil, http.StatusNotImplemented, nil}},
-		{"testPOST", requestConfig{"POST", testServer.urlBase + "/form", "application/x-www-form-urlencoded", strings.NewReader(url.Values{"k": {"v"}}.Encode()), http.StatusOK, []byte(`POST /form: {"k":["v"]}`)}},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			doRequest(t, client, &test.rc)
-		})
 	}
 
 	wsDialer := &websocket.Dialer{
@@ -260,34 +201,5 @@ func TestTransparentProxii(t *testing.T) {
 		},
 	}
 
-	t.Run("websocket", func(t *testing.T) {
-		wscon, _, err := wsDialer.Dial(strings.Replace(testServer.urlBase, "http", "ws", 1)+"/ws", nil)
-		if err != nil {
-			t.Errorf("WebSocket connection error: %v", err)
-			return
-		}
-
-		defer wscon.Close()
-
-		testMessage := []byte("Testing Message")
-
-		err = wscon.WriteMessage(websocket.TextMessage, testMessage)
-		if err != nil {
-			t.Errorf("Websocket Write error: %v", err)
-		} else {
-			mtype, rmsg, err := wscon.ReadMessage()
-
-			switch {
-			case err != nil:
-				t.Errorf("Websocket Receive error: %v", err)
-
-			case mtype != websocket.TextMessage:
-				t.Errorf("Websocket Received incorrect type: %v", mtype)
-
-			case !bytes.Equal(rmsg, testMessage):
-				t.Errorf(`Websocket Received Message is differnt with sent: "%s" != "%s"`, string(rmsg), string(testMessage))
-			}
-		}
-	})
-
+	runTests(t, testServer.urlBase, httpClient, wsDialer)
 }
