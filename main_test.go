@@ -11,8 +11,10 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 type requestConfig struct {
@@ -22,11 +24,15 @@ type requestConfig struct {
 	body                 io.Reader
 	expectedStatusCode   int
 	expectedResponseBody []byte
+	isExpectedError      func(t *testing.T, err error) bool
 }
 
 func doRequest(t *testing.T, client *http.Client, r *requestConfig) error {
 	request, err := http.NewRequest(r.method, r.url, r.body)
 	if err != nil {
+		if r.isExpectedError != nil && r.isExpectedError(t, err) {
+			return nil
+		}
 		t.Fatal("Cannot create request", err)
 		return err
 	}
@@ -37,13 +43,16 @@ func doRequest(t *testing.T, client *http.Client, r *requestConfig) error {
 
 	response, err := client.Do(request)
 	if err != nil {
-		t.Errorf("Client request error: %v", err)
+		if r.isExpectedError != nil && r.isExpectedError(t, err) {
+			return nil
+		}
+		t.Errorf("Client request error(%v): %v", reflect.TypeOf(err), err)
 		return err
 	}
 
 	defer response.Body.Close()
 
-	if r.expectedStatusCode != -1 && response.StatusCode != r.expectedStatusCode {
+	if r.expectedStatusCode != 0 && response.StatusCode != r.expectedStatusCode {
 		errString := fmt.Sprintf("StatusCode(%d) different from expected(%d)", response.StatusCode, r.expectedStatusCode)
 		t.Error(errString)
 		return errors.New(errString)
@@ -52,6 +61,9 @@ func doRequest(t *testing.T, client *http.Client, r *requestConfig) error {
 	if r.expectedResponseBody != nil {
 		responseBody, err := ioutil.ReadAll(response.Body)
 		if err != nil {
+			if r.isExpectedError != nil && r.isExpectedError(t, err) {
+				return nil
+			}
 			t.Error("Couldn't read body", err)
 			return err
 		}
@@ -66,22 +78,183 @@ func doRequest(t *testing.T, client *http.Client, r *requestConfig) error {
 	return nil
 }
 
-func runTests(t *testing.T, urlBase string, httpClient *http.Client, wsDialer *websocket.Dialer) {
+type testData struct {
+	name string
+	rc   requestConfig
+}
 
-	tests := []struct {
-		name string
-		rc   requestConfig
-	}{
-		{"testGET", requestConfig{"GET", urlBase + "/get", "", nil, http.StatusOK, []byte("GET /get")}},
-		{"testPUT", requestConfig{"PUT", urlBase + "/put", "text/plain", strings.NewReader("putbody"), http.StatusOK, []byte("PUT /put: putbody")}},
-		{"testUninplemented", requestConfig{"ZZZ", urlBase + "/zzz", "", nil, http.StatusNotImplemented, nil}},
-		{"testPOST", requestConfig{"POST", urlBase + "/form", "application/x-www-form-urlencoded", strings.NewReader(url.Values{"k": {"v"}}.Encode()), http.StatusOK, []byte(`POST /form: {"k":["v"]}`)}},
+func runTests(t *testing.T, urlBase string, httpClient *http.Client, wsDialer *websocket.Dialer, extraTests []testData) {
+
+	timeoutListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Errorf("Cannot start timeoutListener: %v", err)
+		return
 	}
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			doRequest(t, httpClient, &test.rc)
-		})
+	defer timeoutListener.Close()
+
+	timeoutUrl := "http://" + timeoutListener.Addr().String()
+
+	closerListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Errorf("Cannot start closerListener: %v", err)
+		return
+	}
+
+	defer closerListener.Close()
+
+	closerUrl := "http://" + closerListener.Addr().String()
+
+	go func() {
+		for {
+			s, e := closerListener.Accept()
+			if e != nil {
+				break
+			}
+
+			s.Close()
+		}
+	}()
+
+	commonTests := []testData{
+		{
+			"testGET", requestConfig{
+				method:               "GET",
+				url:                  urlBase + "/get",
+				expectedStatusCode:   http.StatusOK,
+				expectedResponseBody: []byte("GET /get"),
+			},
+		},
+		{
+			"testPUT", requestConfig{
+				method:               "PUT",
+				url:                  urlBase + "/put",
+				contentType:          "text/plain",
+				body:                 strings.NewReader("putbody"),
+				expectedStatusCode:   http.StatusOK,
+				expectedResponseBody: []byte("PUT /put: putbody"),
+			},
+		},
+		{
+			"testPOST", requestConfig{
+				method:               "POST",
+				url:                  urlBase + "/form",
+				contentType:          "application/x-www-form-urlencoded",
+				body:                 strings.NewReader(url.Values{"k": {"v"}}.Encode()),
+				expectedStatusCode:   http.StatusOK,
+				expectedResponseBody: []byte(`POST /form: {"k":["v"]}`),
+			},
+		},
+		{
+			"testUninplemented", requestConfig{
+				method:             "ZZZ",
+				url:                urlBase + "/zzz",
+				expectedStatusCode: http.StatusNotImplemented,
+			},
+		},
+		{
+			"testNotFound", requestConfig{
+				method:             "GET",
+				url:                urlBase + "/notfound",
+				expectedStatusCode: http.StatusNotFound,
+			},
+		},
+		{
+			"testConnectionRejected", requestConfig{
+				method:             "GET",
+				url:                "http://127.0.0.1:1/", // nothing should be listening on this port
+				expectedStatusCode: http.StatusBadGateway,
+				isExpectedError: func(t *testing.T, err error) bool {
+					if urlerr, ok := err.(*url.Error); ok {
+						if conerr, ok := urlerr.Err.(*net.OpError); ok {
+							return conerr.Op == "dial"
+						}
+					}
+					return false
+				},
+			},
+		},
+		{
+			"testConnectTimeout", requestConfig{
+				method:             "GET",
+				url:                "http://10.255.255.1",
+				expectedStatusCode: http.StatusBadGateway,
+				isExpectedError: func(t *testing.T, err error) bool {
+					if urlerr, ok := err.(*url.Error); ok {
+						if conerr, ok := urlerr.Err.(*net.OpError); ok {
+							if conerr.Op == "dial" {
+								if !conerr.Timeout() {
+									t.Skipf("Skipping test because connect timeout testing is not reliable, check this: %v", conerr)
+								}
+
+								return true
+							}
+
+							// rabbit hole: I wanted to test whether it really was a connect timeout, or the network was unreachable,
+							// but at the end on different systems might get different error codes, for example, on windows some errors
+							// will be the winsock code (100XX), so comparing with syscall.ESOMETHING won't work.
+						}
+					}
+					return false
+				},
+			},
+		},
+		{
+			"testReceiveTimeout-1", requestConfig{
+				method:             "GET",
+				url:                timeoutUrl,
+				expectedStatusCode: http.StatusBadGateway,
+				isExpectedError: func(t *testing.T, err error) bool {
+					urlerr, ok := err.(*url.Error)
+					return ok && urlerr.Op == "Get" && urlerr.Timeout()
+				},
+			},
+		},
+		{
+			"testReceiveTimeout-2", requestConfig{
+				method:             "GET",
+				url:                urlBase + "/wait",
+				expectedStatusCode: http.StatusBadGateway,
+				isExpectedError: func(t *testing.T, err error) bool {
+					urlerr, ok := err.(*url.Error)
+					return ok && urlerr.Op == "Get" && urlerr.Timeout()
+				},
+			},
+		},
+		{
+			"testReceiveClose-1", requestConfig{
+				method:             "GET",
+				url:                closerUrl,
+				expectedStatusCode: http.StatusBadGateway,
+				isExpectedError: func(t *testing.T, err error) bool {
+					urlerr, ok := err.(*url.Error)
+					return ok && urlerr.Op == "Get" && !urlerr.Timeout()
+				},
+			},
+		},
+		{
+			"testReceiveClose-2", requestConfig{
+				method:             "GET",
+				url:                urlBase + "/close",
+				expectedStatusCode: http.StatusBadGateway,
+				isExpectedError: func(t *testing.T, err error) bool {
+					urlerr, ok := err.(*url.Error)
+					return ok && urlerr.Op == "Get" && !urlerr.Timeout()
+				},
+			},
+		},
+	}
+
+	// @todo add test to verify when client disconnects, proxii closes the other end connection too.
+	// @todo add test to verify when client "shutdown" write, proxii continues to work normally (sending back response)
+	// @todo add "CONNECT" tests
+	// @todo add errored WebSocket tests
+	for _, testList := range [][]testData{commonTests, extraTests} {
+		for _, test := range testList {
+			t.Run(test.name, func(t *testing.T) {
+				doRequest(t, httpClient, &test.rc)
+			})
+		}
 	}
 
 	// now test websocket
@@ -126,7 +299,16 @@ func TestTestingWebServer(t *testing.T) {
 
 	defer testServer.close()
 
-	runTests(t, testServer.urlBase, http.DefaultClient, websocket.DefaultDialer)
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout: 1000 * time.Millisecond,
+			}).DialContext,
+		},
+		Timeout: time.Millisecond * 2000,
+	}
+
+	runTests(t, testServer.urlBase, client, websocket.DefaultDialer, nil)
 }
 
 func TestProxii(t *testing.T) {
@@ -163,7 +345,7 @@ func TestProxii(t *testing.T) {
 		Proxy: func(request *http.Request) (*url.URL, error) { return proxiiUrl, nil },
 	}
 
-	runTests(t, testServer.urlBase, httpClient, wsDialer)
+	runTests(t, testServer.urlBase, httpClient, wsDialer, nil)
 
 }
 
@@ -201,5 +383,5 @@ func TestTransparentProxii(t *testing.T) {
 		},
 	}
 
-	runTests(t, testServer.urlBase, httpClient, wsDialer)
+	runTests(t, testServer.urlBase, httpClient, wsDialer, nil)
 }

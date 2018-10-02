@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 )
 
 type testingWebServer struct {
@@ -69,8 +70,26 @@ func (tsrv *testingWebServer) ServeHTTP(response http.ResponseWriter, request *h
 			}
 
 			return
+		} else if request.RequestURI == "/notfound" {
+			response.WriteHeader(http.StatusNotFound)
+		} else if request.RequestURI == "/wait" {
+			time.Sleep(2 * time.Second)
+		} else if request.RequestURI == "/close" {
+			//response.WriteHeader(http.StatusCreated)
+
+			hijacker, _ := response.(http.Hijacker)
+
+			clientConn, clientRw, err := hijacker.Hijack()
+			if err == nil {
+				clientRw.WriteString("HTTP/1.1 200 Ok\r\n")
+				clientRw.Flush()
+				clientConn.Close()
+			} else {
+				fmt.Println("Couldn't hijack: ", err)
+			}
+		} else {
+			fmt.Fprintf(response, "GET %s", request.RequestURI)
 		}
-		fmt.Fprintf(response, "GET %s", request.RequestURI)
 
 	case "PUT":
 		var bodyString string
