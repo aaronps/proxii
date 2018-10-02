@@ -73,7 +73,7 @@ func (tsrv *testingWebServer) ServeHTTP(response http.ResponseWriter, request *h
 		} else if request.RequestURI == "/notfound" {
 			response.WriteHeader(http.StatusNotFound)
 		} else if request.RequestURI == "/wait" {
-			time.Sleep(2 * time.Second)
+			time.Sleep(60 * time.Second)
 		} else if request.RequestURI == "/close" {
 			//response.WriteHeader(http.StatusCreated)
 

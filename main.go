@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 const (
@@ -38,7 +39,9 @@ func main() {
 type proxii struct {
 	requestCounter uint64
 	listener       net.Listener
+	dialer         *net.Dialer
 	server         *http.Server
+	client         *http.Client
 }
 
 func newProxii(addr string) (*proxii, error) {
@@ -47,8 +50,19 @@ func newProxii(addr string) (*proxii, error) {
 		return nil, err
 	}
 
+	dialer := &net.Dialer{Timeout: 4000 * time.Millisecond}
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: dialer.DialContext,
+		},
+		Timeout: time.Millisecond * 10000,
+	}
+
 	result := &proxii{
 		listener: listener,
+		client:   client,
+		dialer:   dialer,
 	}
 
 	result.server = &http.Server{Handler: result}
@@ -70,20 +84,20 @@ func (p *proxii) ServeHTTP(response http.ResponseWriter, request *http.Request) 
 	log.Print(requestID, "| Method: ", request.Method, " URL: ", request.URL, " Proto: ", request.Proto, " Host: ", request.Host)
 
 	if request.Method == "CONNECT" {
-		handleConnect(requestID, response, request)
+		handleConnect(requestID, p.dialer, response, request)
 	} else if strings.ToLower(request.Header.Get("Connection")) == "upgrade" && strings.ToLower(request.Header.Get("upgrade")) == "websocket" {
-		handleWebsocket(requestID, response, request)
+		handleWebsocket(requestID, p.dialer, response, request)
 	} else {
-		handleRequest(requestID, response, request)
+		handleRequest(requestID, p.client, response, request)
 	}
 
 	log.Print(requestID, "| Request end: ")
 }
 
-func handleConnect(requestID uint64, response http.ResponseWriter, request *http.Request) {
+func handleConnect(requestID uint64, dialer *net.Dialer, response http.ResponseWriter, request *http.Request) {
 	rh := response.Header()
 
-	conn, err := net.Dial("tcp", request.Host)
+	conn, err := dialer.Dial("tcp", request.Host)
 	if err != nil {
 		if neterror, ok := err.(*net.OpError); ok {
 			switch realerror := neterror.Err.(type) {
@@ -117,7 +131,7 @@ func handleConnect(requestID uint64, response http.ResponseWriter, request *http
 	io.Copy(clientRw, conn)
 }
 
-func handleRequest(requestID uint64, response http.ResponseWriter, request *http.Request) {
+func handleRequest(requestID uint64, client *http.Client, response http.ResponseWriter, request *http.Request) {
 	rh := response.Header()
 
 	// the next two are to support transparent proxy function
@@ -141,7 +155,7 @@ func handleRequest(requestID uint64, response http.ResponseWriter, request *http
 	creq.Header = request.Header
 	delete(creq.Header, "Proxy-Connection")
 
-	client := &http.Client{}
+	//client := &http.Client{}
 	cresp, err := client.Do(creq)
 	if err != nil {
 		log.Print(requestID, "| Request error: ", err)
@@ -165,10 +179,10 @@ func handleRequest(requestID uint64, response http.ResponseWriter, request *http
 	io.Copy(response, cresp.Body)
 }
 
-func handleWebsocket(requestID uint64, response http.ResponseWriter, request *http.Request) {
+func handleWebsocket(requestID uint64, dialer *net.Dialer, response http.ResponseWriter, request *http.Request) {
 	rh := response.Header()
 
-	conn, err := net.Dial("tcp", request.Host)
+	conn, err := dialer.Dial("tcp", request.Host)
 	if err != nil {
 		if neterror, ok := err.(*net.OpError); ok {
 			switch realerror := neterror.Err.(type) {
